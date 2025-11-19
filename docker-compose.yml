@@ -1,0 +1,59 @@
+services:
+  stereo-obstaculos:
+    build: .
+    container_name: stereo-obstaculos
+    restart: unless-stopped
+
+    # Mapea el único dispositivo UVC (SBS lado-a-lado)
+    devices:
+      - "/dev/video0:/dev/video0"
+
+    # Da acceso al grupo "video" (permisos V4L2)
+    group_add:
+      - "video"
+
+    ports:
+      - "8080:8080"
+
+    environment:
+      # ==== Dispositivos / formato de captura ====
+      LEFT_DEV: "/dev/video0"
+      RIGHT_DEV: ""            # vacío => SBS puro
+      WIDTH: "1344"            # ZED UVC reporta 1344x376@15 YUYV
+      HEIGHT: "376"
+      FPS: "15"
+
+      # ==== Estimación métrica y umbral ====
+      THRESHOLD_M: "1.5"
+      BASELINE_M: "0.06"
+      FOCAL_PX: "700"
+
+      # ==== Vista previa ====
+      ENABLE_PREVIEW: "true"   # <- CAMBIADO
+
+      # ==== Orientación SBS (ajustá si ves mitades cruzadas/espejadas) ====
+      SWAP_HALVES: "true"      # invierte izquierda/derecha
+      HFLIP_LEFT: "true"
+      HFLIP_RIGHT: "true"
+      VFLIP_LEFT: "false"
+      VFLIP_RIGHT: "false"
+
+      # ==== Rectificación sin YAML (mejora disparidad) ====
+      UNCAL_RECTIFY: "true"
+      UNCAL_FEATURES: "1200"
+
+      # ==== Banda de interés (metros) para /detect ====
+      BAND_X_HALF_M: "0.70"    # ±0.70 m laterales
+      BAND_Y_DOWN_M: "0.70"    # 0.70 m hacia abajo
+      BAND_Y_UP_M: "0.40"      # 0.40 m hacia arriba
+      Z_MIN_M: "0.20"
+      Z_MAX_M: "10.0"
+
+    volumes:
+      - ./data:/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
