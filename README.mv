@@ -1,0 +1,305 @@
+````markdown
+# Servicio Stereo CPU Obstacle (FastAPI + OpenCV)
+
+Este proyecto expone, vía **FastAPI**, un servicio HTTP que trabaja con una cámara **estéreo** (por ejemplo una ZED en modo UVC) para:
+
+- Capturar imágenes estéreo (dos mitades lado a lado o dos `/dev/videoX` separados).
+- Rectificar y alinear las imágenes (con o sin archivo de calibración).
+- Calcular disparidad y un mapa de profundidad aproximado en CPU.
+- Detectar si hay obstáculos por delante del vehículo en una banda de interés.
+- Proveer vistas de diagnóstico y streams simples para monitorear qué ve la cámara.
+
+El archivo principal es `main.py`, que levanta el servicio FastAPI y define toda la lógica de captura, rectificación, disparidad y endpoints.
+
+---
+
+## 1. Flujo general
+
+1. **Lectura de variables de entorno**  
+   El script toma casi toda la configuración desde variables de entorno:
+   - Dispositivos de video (`LEFT_DEV`, `RIGHT_DEV`).
+   - Resolución y FPS.
+   - Parámetros de geometría estéreo (baseline, focal).
+   - Banda de interés para detectar obstáculos.
+   - Opciones de rectificación y alineación manual.
+
+2. **Apertura de cámaras**  
+   Usa `cv2.VideoCapture` sobre:
+   - Dos dispositivos (ej: `/dev/video0` y `/dev/video1`), o
+   - Un único dispositivo SBS (side-by-side) donde la imagen viene con izquierda y derecha en la misma frame.
+
+3. **Preprocesado por frame** (`grab_pair()`):
+   - Se toman los frames izquierdo y derecho.
+   - Se corrige orientación (flips, swap de mitades).
+   - Se aplica alineación manual (rotación, desplazamiento, escala).
+   - Se convierten a escala de grises.
+   - Se rectifican:
+     - Con archivo de calibración YAML (si existe) **o**
+     - De forma no calibrada usando `stereoRectifyUncalibrated` + optical flow.
+
+4. **Cálculo de disparidad y profundidad**  
+   - Se usa un `StereoSGBM` ajustado para CPU.
+   - Se convierte la disparidad a coordenadas 3D (X, Y, Z) usando:
+     - La matriz `Q` de calibración, o
+     - Un modelo pinhole simple (baseline + focal).
+
+5. **Detección de obstáculos**  
+   - Se define una **banda de interés** en X (izq/der), Y (arriba/abajo) y Z (distancia).
+   - Dentro de esa banda se calcula:
+     - Distancia mínima al obstáculo (`min_distance_m`).
+     - Cobertura de puntos válidos (`coverage`).
+   - Si la distancia mínima es menor que `THRESHOLD_M`, se considera que hay obstáculo (`"obstacle": true`).
+
+6. **Exposición vía HTTP**  
+   FastAPI publica varios endpoints (`/`, `/frame`, `/mono`, `/mono_stream`, `/grid`, `/preview`, `/detect`, `/frame_info`, etc.) para consumir tanto la imagen como la información de profundidad/obstáculo.
+
+---
+
+## 2. Variables de entorno principales
+
+Estas son las más importantes (todas opcionales, tienen default razonables):
+
+| Variable          | Tipo    | Default         | Descripción |
+|-------------------|--------|-----------------|------------|
+| `LEFT_DEV`        | str    | `/dev/video0`   | Dispositivo de la cámara izquierda o SBS. |
+| `RIGHT_DEV`       | str    | `/dev/video1`   | Dispositivo de la cámara derecha. Vacío (`""`) si usás SBS puro. |
+| `WIDTH`           | int    | `1344`          | Ancho del frame. Para ZED UVC: 1344. |
+| `HEIGHT`          | int    | `376`           | Alto del frame. Para ZED UVC: 376. |
+| `FPS`             | int    | `15`            | FPS objetivo de captura. |
+| `THRESHOLD_M`     | float  | `1.5`           | Umbral de distancia (m) para considerar que hay obstáculo. |
+| `ENABLE_PREVIEW`  | bool   | `true`          | Habilita/deshabilita el endpoint `/preview`. |
+| `CALIB_YAML`      | str    | `""`            | Ruta a archivo YAML con calibración estéreo. Si existe, se usa para rectificación. |
+| `BASELINE_M`      | float  | `0.06`          | Baseline (m) para el modelo pinhole si no hay YAML. |
+| `FOCAL_PX`        | float  | `700`           | Focal en píxeles para el modelo pinhole. |
+
+**Banda de interés (volumen frente al vehículo):**
+
+| Variable           | Descripción |
+|--------------------|-----------|
+| `BAND_X_HALF_M`    | Semi-ancho lateral (±X en metros). |
+| `BAND_Y_DOWN_M`    | Extensión hacia abajo en Y (m). |
+| `BAND_Y_UP_M`      | Extensión hacia arriba en Y (m). |
+| `Z_MIN_M`          | Distancia mínima (cerca) a considerar (m). |
+| `Z_MAX_M`          | Distancia máxima (lejos) a considerar (m). |
+
+**SBS / Flips:**
+
+| Variable       | Descripción |
+|----------------|------------|
+| `SWAP_HALVES`  | Si `true`, intercambia izquierda/derecha en la imagen SBS. |
+| `HFLIP_LEFT`   | Flip horizontal cámara izquierda. |
+| `HFLIP_RIGHT`  | Flip horizontal cámara derecha. |
+| `VFLIP_LEFT`   | Flip vertical cámara izquierda. |
+| `VFLIP_RIGHT`  | Flip vertical cámara derecha. |
+
+**Rectificación no calibrada:**
+
+| Variable            | Descripción |
+|---------------------|------------|
+| `UNCAL_RECTIFY`     | Si `true`, intenta rectificación estéreo sin YAML. |
+| `UNCAL_FEATURES`    | Cantidad máxima de features a usar en el matching. |
+
+**Alineación manual fina:**
+
+| Variable       | Descripción |
+|----------------|------------|
+| `MANUAL_ALIGN` | Habilita la alineación manual. |
+| `ROT_L_DEG`    | Rotación en grados para la cámara izquierda. |
+| `ROT_R_DEG`    | Rotación en grados para la cámara derecha. |
+| `SHIFT_L_X/Y`  | Desplazamiento en píxeles (X/Y) para izquierda. |
+| `SHIFT_R_X/Y`  | Desplazamiento en píxeles (X/Y) para derecha. |
+| `SCALE_L/R`    | Escala (zoom) para izquierda/derecha. |
+
+---
+
+## 3. Endpoints
+
+### 3.1. HTML simple
+
+- `GET /`  
+  Página HTML mínima que muestra lo que devuelve `/frame` en un `<img>` y lo refresca con JavaScript (~10 FPS).  
+  Útil para verificar rápidamente qué ve la cámara estéreo.
+
+---
+
+### 3.2. Salud y diagnóstico
+
+- `GET /health`  
+  Devuelve un JSON con:
+  - Estado general (`status`, `mode`).
+  - Si hay rectificación por YAML o no calibrada.
+  - Configuración actual (W, H, FPS, dispositivos).
+  - Flags de SBS/flip.
+  - Parámetros de alineación manual.
+  - Definición de la banda de interés en metros.
+
+- `GET /frame_info`  
+  Devuelve un JSON con:
+  - Resolución y FPS detectados en `capL` (y `capR` si existe).
+  - Flag `use_sbs` indicando si se está trabajando en modo SBS.
+
+---
+
+### 3.3. Frames y streams
+
+- `GET /frame`  
+  Captura un par estéreo y devuelve una imagen JPEG:
+  - Si hay dos cámaras, concatena izquierda y derecha (`hstack`).
+  - Si no, devuelve sólo la izquierda.
+
+- `GET /mono?eye=left|right`  
+  Devuelve un **frame JPG** de una sola cámara (mitad izquierda o derecha ya procesada por `grab_pair()`).
+
+- `GET /mono_stream?eye=left|right`  
+  Devuelve un **stream MJPEG** de una sola cámara (monocular), ideal para embebido en un `<img>` o `<video>`.
+
+  Ejemplo rápido en HTML:
+
+  ```html
+  <img src="http://HOST:PUERTO/mono_stream?eye=left">
+````
+
+* `GET /grid`
+  Devuelve una imagen estéreo con **líneas horizontales** de diagnóstico para chequear alineación/epipolaridad.
+  Sirve para ver si la rectificación está bien: los puntos correspondientes deberían caer sobre la misma línea horizontal en ambos ojos.
+
+---
+
+### 3.4. Profundidad y obstáculos
+
+* `GET /preview`
+  (Si `ENABLE_PREVIEW=true`).
+  Devuelve un **mapa de profundidad coloreado** en JPG:
+
+  * Calcula disparidad con SGBM.
+  * Convierte a Z (distancia).
+  * Normaliza distancias válidas a una escala de colores (`COLORMAP_JET`), invirtiendo para que **rojo = cerca**, **azul = lejos**.
+  * Puntos inválidos (sin disparidad) se ponen en negro.
+
+  Útil para afinar parámetros de SGBM, rectificación y alineación.
+
+* `GET /detect`
+  Endpoint clave para el sistema de navegación:
+
+  * Toma un par rectificado.
+  * Calcula disparidad y luego X, Y, Z.
+  * Aplica la máscara de la **banda de interés** (`band_mask_xyz`).
+  * Obtiene:
+
+    * `min_distance_m`: mínima distancia dentro de la banda.
+    * `coverage`: proporción de píxeles válidos en esa banda.
+    * `obstacle`: `true` si la distancia mínima es menor que `THRESHOLD_M`.
+
+  Respuesta típica:
+
+  ```json
+  {
+    "obstacle": true,
+    "min_distance_m": 0.85,
+    "coverage": 0.42,
+    "band_m": {
+      "x_half": 0.7,
+      "y_down": 0.7,
+      "y_up": 0.4,
+      "z_range": [0.2, 10.0]
+    },
+    "params": {
+      "threshold_m": 1.5,
+      "rectified_yaml": false,
+      "rectified_uncal": true,
+      "baseline_m": 0.06,
+      "focal_px": 700
+    },
+    "latency_s": 0.08
+  }
+  ```
+
+  Esto es lo que debería consultar el controlador del vehículo para saber si debe frenar o esquivar.
+
+---
+
+## 4. Ejecución
+
+### 4.1. Dependencias básicas
+
+Necesitás (mínimo):
+
+* Python 3.10+ (en el contenedor usás `python:3.12-slim`).
+* Paquetes:
+
+  * `fastapi`
+  * `uvicorn[standard]`
+  * `opencv-python` (o `opencv-python-headless`)
+  * `numpy`
+  * `pyyaml`
+
+Ejemplo de instalación:
+
+```bash
+pip install fastapi "uvicorn[standard]" opencv-python numpy pyyaml
+```
+
+*(En el contenedor probablemente ya estén en `requirements.txt`.)*
+
+---
+
+### 4.2. Levantar el servicio localmente
+
+Desde el directorio donde está `main.py`:
+
+```bash
+export LEFT_DEV=/dev/video0
+export RIGHT_DEV=/dev/video1     # o vacío si usás SBS puro
+export WIDTH=1344
+export HEIGHT=376
+export FPS=15
+
+uvicorn main:app --host 0.0.0.0 --port 8080
+```
+
+Luego podés probar:
+
+* `http://localhost:8080/`  → HTML simple con `/frame`.
+* `http://localhost:8080/frame`
+* `http://localhost:8080/mono_stream?eye=left`
+* `http://localhost:8080/preview`
+* `http://localhost:8080/detect`
+
+---
+
+### 4.3. Uso desde otro servicio (por ejemplo, Django)
+
+Tu controlador (Django u otro) puede consultar:
+
+* `/detect` para decidir si hay que frenar/esquivar.
+* `/mono_stream` o `/mono` para mostrar la vista al conductor/operador.
+* `/health` y `/frame_info` para diagnósticos y configuración.
+
+Ejemplo mínimo en Python:
+
+```python
+import requests
+
+resp = requests.get("http://stereo-host:8080/detect", timeout=0.5)
+data = resp.json()
+if data["obstacle"]:
+    print("⚠ Obstáculo a", data["min_distance_m"], "m")
+```
+
+---
+
+## 5. Resumen
+
+En pocas palabras, este servicio:
+
+* **Lee** de una cámara estéreo física (ZED UVC o similar).
+* **Rectifica y alinea** las imágenes para que sean útiles para estéreo.
+* **Calcula profundidad** en CPU usando OpenCV SGBM.
+* **Define una banda de interés** frente al vehículo.
+* **Indica si hay obstáculos** en esa banda y a qué distancia mínima.
+* **Expone todo vía HTTP/FastAPI** con endpoints simples para integrar con tu sistema de navegación y para monitoreo visual.
+
+Es el “módulo de percepción estéreo” que corre aparte (por ejemplo en la PC industrial / contenedor) y que el controlador del VAE consulta para tomar decisiones de movimiento.
+
+```
+```

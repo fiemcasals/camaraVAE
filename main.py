@@ -1,14 +1,18 @@
-import os, time, yaml
-import numpy as np
+import os
+import time
+import yaml
+from typing import Tuple
+
 import cv2
+import numpy as np
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 
 # ======================= ENV =======================
-def getenvf(k, d):
+def getenvf(k: str, d):
     try:
         return float(os.getenv(k, str(d)))
-    except:
+    except Exception:
         return float(d)
 
 LEFT_DEV      = os.getenv("LEFT_DEV",  "/dev/video0")
@@ -42,42 +46,90 @@ VFLIP_RIGHT   = os.getenv("VFLIP_RIGHT", "false").lower() == "true"
 UNCAL_RECTIFY  = os.getenv("UNCAL_RECTIFY", "true").lower() == "true"
 UNCAL_FEATURES = int(os.getenv("UNCAL_FEATURES", "1200"))
 
-# >>>>>>>>>> Alineación manual fina (NUEVO) <<<<<<<<<<
+# Alineación manual fina
 MANUAL_ALIGN = os.getenv("MANUAL_ALIGN", "true").lower() == "true"
-ROT_L_DEG = getenvf("ROT_L_DEG", 0.0)     # ej: -3.5
+ROT_L_DEG = getenvf("ROT_L_DEG", 0.0)
 ROT_R_DEG = getenvf("ROT_R_DEG", 0.0)
-SHIFT_L_X = int(float(os.getenv("SHIFT_L_X", "0")))   # px, der +
-SHIFT_L_Y = int(float(os.getenv("SHIFT_L_Y", "0")))   # px, abajo +
+SHIFT_L_X = int(float(os.getenv("SHIFT_L_X", "0")))
+SHIFT_L_Y = int(float(os.getenv("SHIFT_L_Y", "0")))
 SHIFT_R_X = int(float(os.getenv("SHIFT_R_X", "0")))
 SHIFT_R_Y = int(float(os.getenv("SHIFT_R_Y", "0")))
-SCALE_L   = getenvf("SCALE_L", 1.0)       # microzoom (1.0 = sin cambio)
+SCALE_L   = getenvf("SCALE_L", 1.0)
 SCALE_R   = getenvf("SCALE_R", 1.0)
 
 app = FastAPI(title="Stereo CPU Obstacle Service")
 
 # ================== CÁMARAS ==================
-def open_cam(dev, w, h, fps=15):
-    cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+def open_cam(dev, w: int, h: int, fps: int = 15):
+    """
+    Abre la cámara aceptando:
+      - índice tipo "0" o 0
+      - ruta tipo "/dev/video0" (intentamos derivar el índice)
+
+    Intenta primero CAP_V4L2; si falla, hace fallback a backend por defecto.
+    """
+    original_dev = dev
+
+    # Normalizamos dev
+    dev_arg = dev
+    if isinstance(dev, str):
+        if dev.isdigit():
+            dev_arg = int(dev)  # <-- "0" -> 0
+        elif dev.startswith("/dev/video"):
+            try:
+                idx_str = dev[len("/dev/video"):]
+                dev_arg = int(idx_str)
+            except Exception:
+                dev_arg = dev  # dejamos el string si falla
+
+    print(f"[open_cam] Intentando abrir cámara: {original_dev!r} (arg={dev_arg!r})")
+
+    # Primer intento: V4L2
+    cap = cv2.VideoCapture(dev_arg, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        print("[open_cam] No abrió con CAP_V4L2, probando backend por defecto...")
+        cap.release()
+        cap = cv2.VideoCapture(dev_arg)
+
+    if not cap.isOpened():
+        print("[open_cam] ERROR: no se pudo abrir cámara:", dev_arg)
+        return cap
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
     cap.set(cv2.CAP_PROP_FPS, fps)
-    # Tu dispositivo reporta sólo YUYV en 1344x376@15
-    fourcc = cv2.VideoWriter_fourcc(*'YUYV')
-    cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*"YUYV")
+        cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+    except Exception as e:
+        print("[open_cam] WARN: no se pudo setear FOURCC YUYV:", e)
+
+    print(
+        f"[open_cam] Abierta OK: W={cap.get(cv2.CAP_PROP_FRAME_WIDTH)}, "
+        f"H={cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}, FPS={cap.get(cv2.CAP_PROP_FPS)}"
+    )
     return cap
 
+# Crea los capturadores GLOBALMENTE (capL y capR)
+# Crea los capturadores GLOBALMENTE (capL y capR)
 capL = open_cam(LEFT_DEV, W, H, FPS)
-capR = open_cam(RIGHT_DEV, W, H, FPS) if RIGHT_DEV else cv2.VideoCapture()  # vacío si SBS puro
+capR = open_cam(RIGHT_DEV, W, H, FPS) if RIGHT_DEV else cv2.VideoCapture()
 
 use_sbs = False
+
 if not capL.isOpened() and capR.isOpened():
+    # Intercambiamos si la derecha abrió y la izquierda no
+    print("[WARN] capL no abrió, pero capR sí. Intercambiando...")
     capL, capR = capR, capL
 
 if not capL.isOpened():
-    raise RuntimeError("No se pudo abrir cámara principal (LEFT_DEV).")
+    print("[WARN] No se pudo abrir cámara principal (LEFT_DEV). "
+          "El servicio arranca igual, pero los endpoints de video devolverán error.")
 
 if not capR.isOpened():
     use_sbs = True  # un solo /dev/video con imagen lado-a-lado
+    print("[INFO] capR no abrió: se asume modo SBS (una sola cámara)")
 
 # ========== Calibración/Rectificación (YAML) ==========
 rectify = False
@@ -87,57 +139,91 @@ mapLx = mapLy = mapRx = mapRy = None
 if CALIB_YAML and os.path.exists(CALIB_YAML):
     with open(CALIB_YAML, "r") as f:
         data = yaml.safe_load(f)
-    K1 = np.array(data["K1"]); D1 = np.array(data["D1"]).ravel()
-    K2 = np.array(data["K2"]); D2 = np.array(data["D2"]).ravel()
-    R  = np.array(data["R"]);  T  = np.array(data["T"]).ravel()
+    K1 = np.array(data["K1"])
+    D1 = np.array(data["D1"]).ravel()
+    K2 = np.array(data["K2"])
+    D2 = np.array(data["D2"]).ravel()
+    R  = np.array(data["R"])
+    T  = np.array(data["T"]).ravel()
     R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
-        K1, D1, K2, D2, (W, H), R, T, flags=cv2.CALIB_ZERO_DISPARITY, alpha=0
+        K1, D1, K2, D2, (W, H), R, T,
+        flags=cv2.CALIB_ZERO_DISPARITY, alpha=0
     )
-    mapLx, mapLy = cv2.initUndistortRectifyMap(K1, D1, R1, P1, (W, H), cv2.CV_32FC1)
-    mapRx, mapRy = cv2.initUndistortRectifyMap(K2, D2, R2, P2, (W, H), cv2.CV_32FC1)
+    mapLx, mapLy = cv2.initUndistortRectifyMap(
+        K1, D1, R1, P1, (W, H), cv2.CV_32FC1
+    )
+    mapRx, mapRy = cv2.initUndistortRectifyMap(
+        K2, D2, R2, P2, (W, H), cv2.CV_32FC1
+    )
     rectify = True
 
 # ========== Rectificación SIN calibración ==========
 def _find_correspondences(imgL, imgR, max_pts=1200):
-    ptsL = cv2.goodFeaturesToTrack(imgL, maxCorners=max_pts, qualityLevel=0.01, minDistance=7)
+    ptsL = cv2.goodFeaturesToTrack(
+        imgL,
+        maxCorners=max_pts,
+        qualityLevel=0.01,
+        minDistance=7,
+    )
     if ptsL is None:
         return None, None
     ptsR, st, _ = cv2.calcOpticalFlowPyrLK(
         imgL, imgR, ptsL, None,
-        winSize=(21,21), maxLevel=3,
-        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+        winSize=(21, 21),
+        maxLevel=3,
+        criteria=(
+            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+            30,
+            0.01,
+        ),
     )
     if ptsR is None or st is None:
         return None, None
     st = st.reshape(-1)
-    pL = ptsL.reshape(-1,2)[st==1]
-    pR = ptsR.reshape(-1,2)[st==1]
+    pL = ptsL.reshape(-1, 2)[st == 1]
+    pR = ptsR.reshape(-1, 2)[st == 1]
     return pL, pR
 
 def uncalibrated_rectify(grayL, grayR, max_pts=1200):
     pL, pR = _find_correspondences(grayL, grayR, max_pts=max_pts)
     if pL is None or len(pL) < 50:
         return grayL, grayR
-    F, mask = cv2.findFundamentalMat(pL, pR, cv2.FM_RANSAC, 1.0, 0.99)
+    F, mask = cv2.findFundamentalMat(
+        pL, pR, cv2.FM_RANSAC, 1.0, 0.99
+    )
     if F is None:
         return grayL, grayR
     h, w = grayL.shape
-    ok, HL, HR = cv2.stereoRectifyUncalibrated(pL[mask.ravel()==1], pR[mask.ravel()==1], F, imgSize=(w,h))
+    ok, HL, HR = cv2.stereoRectifyUncalibrated(
+        pL[mask.ravel() == 1],
+        pR[mask.ravel() == 1],
+        F,
+        imgSize=(w, h),
+    )
     if not ok:
         return grayL, grayR
-    rectL = cv2.warpPerspective(grayL, HL, (w,h))
-    rectR = cv2.warpPerspective(grayR, HR, (w,h))
+    rectL = cv2.warpPerspective(grayL, HL, (w, h))
+    rectR = cv2.warpPerspective(grayR, HR, (w, h))
     return rectL, rectR
 
 # ========== Alineación Manual (rotación/shift/escala) ==========
 def _affine_rotate_shift(img, deg, sx, sy, scale=1.0):
-    if (abs(deg) < 1e-3) and (sx == 0) and (sy == 0) and (abs(scale-1.0) < 1e-3):
+    if (
+        abs(deg) < 1e-3
+        and sx == 0
+        and sy == 0
+        and abs(scale - 1.0) < 1e-3
+    ):
         return img
     h, w = img.shape[:2]
-    M = cv2.getRotationMatrix2D((w/2, h/2), deg, scale)
-    M[0,2] += sx
-    M[1,2] += sy
-    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), deg, scale)
+    M[0, 2] += sx
+    M[1, 2] += sy
+    return cv2.warpAffine(
+        img, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT101,
+    )
 
 def apply_manual_alignment(left, right):
     if not MANUAL_ALIGN:
@@ -146,23 +232,26 @@ def apply_manual_alignment(left, right):
     right = _affine_rotate_shift(right, ROT_R_DEG, SHIFT_R_X, SHIFT_R_Y, SCALE_R)
     return left, right
 
-# ========== SGBM (AJUSTES QUE PEDISTE) ==========
+# ========== SGBM ==========
 bm = cv2.StereoSGBM_create(
     minDisparity=0,
-    numDisparities=16*8,   # << antes 16*6
-    blockSize=7,           # << antes 5
-    P1=8*3*7**2,
-    P2=32*3*7**2,
+    numDisparities=16 * 8,
+    blockSize=7,
+    P1=8 * 3 * 7 ** 2,
+    P2=32 * 3 * 7 ** 2,
     speckleWindowSize=80,
     speckleRange=3,
     uniquenessRatio=8,
-    disp12MaxDiff=1
+    disp12MaxDiff=1,
 )
 
-# ================== FUNCIONES ==================
-def grab_pair():
+# ================== FUNCIONES DE CAPTURA ==================
+def grab_pair() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Captura un par estéreo y devuelve (frameL, frameR, grayL, grayR)."""
+    global capL, capR, use_sbs
+
     okL, frameL = capL.read()
-    if not okL:
+    if not okL or frameL is None:
         raise RuntimeError("No se pudo capturar de la cámara principal")
 
     if use_sbs:
@@ -171,20 +260,22 @@ def grab_pair():
         l = frameL[:, :mid]
         r = frameL[:, mid:]
 
-        # Corrige orden/orientación de mitades
         left, right = (r, l) if SWAP_HALVES else (l, r)
-        if HFLIP_LEFT:  left  = cv2.flip(left,  1)
-        if VFLIP_LEFT:  left  = cv2.flip(left,  0)
-        if HFLIP_RIGHT: right = cv2.flip(right, 1)
-        if VFLIP_RIGHT: right = cv2.flip(right, 0)
 
-        # >>> Alineación manual previa (roll/shift/escala)
+        if HFLIP_LEFT:
+            left = cv2.flip(left, 1)
+        if VFLIP_LEFT:
+            left = cv2.flip(left, 0)
+        if HFLIP_RIGHT:
+            right = cv2.flip(right, 1)
+        if VFLIP_RIGHT:
+            right = cv2.flip(right, 0)
+
         left, right = apply_manual_alignment(left, right)
 
-        grayL = cv2.cvtColor(left,  cv2.COLOR_BGR2GRAY)
+        grayL = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
         grayR = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
 
-        # Rectificación (YAML o no calibrada)
         if rectify:
             grayL = cv2.remap(grayL, mapLx, mapLy, cv2.INTER_LINEAR)
             grayR = cv2.remap(grayR, mapRx, mapRy, cv2.INTER_LINEAR)
@@ -195,26 +286,31 @@ def grab_pair():
 
     # Modo dos /dev/video
     okR, frameR = capR.read()
-    if not okR:
+    if not okR or frameR is None:
         raise RuntimeError("No se pudo capturar de la cámara secundaria")
 
-    # flips si hiciera falta
     left, right = frameL, frameR
-    if HFLIP_LEFT:  left  = cv2.flip(left,  1)
-    if VFLIP_LEFT:  left  = cv2.flip(left,  0)
-    if HFLIP_RIGHT: right = cv2.flip(right, 1)
-    if VFLIP_RIGHT: right = cv2.flip(right, 0)
 
-    # >>> Alineación manual previa
+    if HFLIP_LEFT:
+        left = cv2.flip(left, 1)
+    if VFLIP_LEFT:
+        left = cv2.flip(left, 0)
+    if HFLIP_RIGHT:
+        right = cv2.flip(right, 1)
+    if VFLIP_RIGHT:
+        right = cv2.flip(right, 0)
+
     left, right = apply_manual_alignment(left, right)
 
-    grayL = cv2.cvtColor(left,  cv2.COLOR_BGR2GRAY)
+    grayL = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
     grayR = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
+
     if rectify:
         grayL = cv2.remap(grayL, mapLx, mapLy, cv2.INTER_LINEAR)
         grayR = cv2.remap(grayR, mapRx, mapRy, cv2.INTER_LINEAR)
     elif UNCAL_RECTIFY:
         grayL, grayR = uncalibrated_rectify(grayL, grayR, UNCAL_FEATURES)
+
     return left, right, grayL, grayR
 
 def disparity_to_points3d_full(disp):
@@ -237,7 +333,7 @@ def disparity_to_points3d_full(disp):
     return X, Y, Z
 
 def band_mask_xyz(X, Y, Z):
-    mask = (np.isfinite(X) & np.isfinite(Y) & np.isfinite(Z))
+    mask = np.isfinite(X) & np.isfinite(Y) & np.isfinite(Z)
     mask &= (np.abs(X) <= BAND_X_HALF_M)
     mask &= (Y >= -BAND_Y_DOWN_M) & (Y <= BAND_Y_UP_M)
     mask &= (Z >= Z_MIN_M) & (Z <= Z_MAX_M)
@@ -252,7 +348,6 @@ def min_distance_in_band(X, Y, Z):
 
 # ================== ENDPOINTS ==================
 
-# 🔹 Página HTML simple que muestra el "video" usando /frame
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
@@ -277,16 +372,9 @@ def index():
         </style>
       </head>
       <body>
-        <h1>Stream ZED (/frame)</h1>
+        <h1>Stream ZED (/mono_stream)</h1>
         <p>Resolución esperada: 1344x376 @ 15 FPS (SBS)</p>
-        <img id="cam" src="/frame" alt="ZED frame" />
-        <script>
-          const img = document.getElementById('cam');
-          function refresh() {
-            img.src = '/frame?ts=' + Date.now();
-          }
-          setInterval(refresh, 100);  // ~10 fps
-        </script>
+        <img id="cam" src="/mono_stream" />
       </body>
     </html>
     """
@@ -309,15 +397,16 @@ def health():
         "manual_align": {
             "enabled": MANUAL_ALIGN,
             "rot_l_deg": ROT_L_DEG, "rot_r_deg": ROT_R_DEG,
-            "shift_l": [SHIFT_L_X, SHIFT_L_Y], "shift_r": [SHIFT_R_X, SHIFT_R_Y],
-            "scale_l": SCALE_L, "scale_r": SCALE_R
+            "shift_l": [SHIFT_L_X, SHIFT_L_Y],
+            "shift_r": [SHIFT_R_X, SHIFT_R_Y],
+            "scale_l": SCALE_L, "scale_r": SCALE_R,
         },
         "band_m": {
             "x_half": BAND_X_HALF_M,
             "y_down": BAND_Y_DOWN_M,
             "y_up": BAND_Y_UP_M,
-            "z_range": [Z_MIN_M, Z_MAX_M]
-        }
+            "z_range": [Z_MIN_M, Z_MAX_M],
+        },
     }
 
 @app.get("/frame")
@@ -337,47 +426,27 @@ def frame():
 
 @app.get("/mono")
 def mono(eye: str = "left"):
-    """
-    Devuelve solo una de las cámaras (mitad izquierda o derecha) ya procesada
-    por grab_pair() (SBS, flips, rectificación, etc).
-
-    Parámetros:
-      - eye=left  (por defecto)
-      - eye=right
-    """
     try:
         frameL, frameR, _, _ = grab_pair()
     except Exception as e:
         raise HTTPException(500, f"No se pudo capturar frame: {e}")
-
-    # Normalizamos el parámetro
     eye = (eye or "left").lower()
-
-    # Elegimos qué mitad mostrar
     if eye == "right" and frameR is not None:
         view = frameR
     else:
-        # por defecto usamos la izquierda
         view = frameL
-
-    # Nos aseguramos de trabajar sobre una copia válida en BGR
     view = view.copy()
-
     ok, buf = cv2.imencode(".jpg", view)
     if not ok:
         raise HTTPException(500, "Error codificando frame mono.")
     return Response(content=buf.tobytes(), media_type="image/jpeg")
 
 def mono_frame_generator(eye: str = "left"):
-    """
-    Generador de frames JPEG para el stream monocular.
-    """
     eye = (eye or "left").lower()
     while True:
         try:
             frameL, frameR, _, _ = grab_pair()
         except Exception as e:
-            # Si algo falla, seguimos intentando
             print(f"[mono_stream] error capturando frame: {e}")
             time.sleep(0.05)
             continue
@@ -399,38 +468,31 @@ def mono_frame_generator(eye: str = "left"):
             b"\r\n"
         )
 
-
 @app.get("/mono_stream")
 def mono_stream(eye: str = "left"):
-    """
-    Stream MJPEG de una sola cámara (monocular).
-    Usar como:
-      - /mono_stream
-      - /mono_stream?eye=right
-    Se puede ver directo en el navegador o en un <img>.
-    """
     return StreamingResponse(
         mono_frame_generator(eye),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
-
 @app.get("/grid")
 def grid():
-    """Vista de diagnóstico con líneas horizontales para chequear epipolaridad."""
     try:
         frameL, frameR, _, _ = grab_pair()
     except Exception as e:
         raise HTTPException(500, f"No se pudo capturar frame: {e}")
+
     def draw_lines(img, step=40):
         out = img.copy()
         h = out.shape[0]
         for y in range(step, h, step):
-            cv2.line(out, (0,y), (out.shape[1]-1,y), (0,255,0), 1, cv2.LINE_AA)
+            cv2.line(out, (0, y), (out.shape[1] - 1, y), (0, 255, 0), 1, cv2.LINE_AA)
         return out
+
     l = draw_lines(frameL)
     r = draw_lines(frameR) if frameR is not None else None
     view = np.hstack((l, r)) if r is not None else l
+
     ok, buf = cv2.imencode(".jpg", view)
     if not ok:
         raise HTTPException(500, "No se pudo codificar grid")
@@ -445,25 +507,14 @@ def preview():
     disp = bm.compute(grayL, grayR)
     _, _, Z = disparity_to_points3d_full(disp)
 
-    # Máscara de puntos con profundidad válida
     valid = np.isfinite(Z)
-
-    # Máxima distancia a mostrar en el mapa (puede ser distinto de THRESHOLD_M*2 si querés)
     max_m = THRESHOLD_M * 2.0
 
-    # Por defecto: todo “muy lejos”
     depth = np.full_like(Z, max_m, dtype=np.float32)
-
-    # Donde hay datos válidos, usamos Z recortado
     depth[valid] = np.clip(Z[valid], 0.0, max_m)
 
-    # Normalizamos 0..max_m -> 0..255
     depth_norm = (depth / max_m * 255.0).astype(np.uint8)
-
-    # Invertimos para que cerca = rojo, lejos = azul
     depth_vis = cv2.applyColorMap(255 - depth_norm, cv2.COLORMAP_JET)
-
-    # Opcional: poner los inválidos directamente en negro para verlos claros
     depth_vis[~valid] = (0, 0, 0)
 
     ok, buf = cv2.imencode(".jpg", depth_vis)
@@ -491,16 +542,16 @@ def detect():
             "x_half": BAND_X_HALF_M,
             "y_down": BAND_Y_DOWN_M,
             "y_up": BAND_Y_UP_M,
-            "z_range": [Z_MIN_M, Z_MAX_M]
+            "z_range": [Z_MIN_M, Z_MAX_M],
         },
         "params": {
             "threshold_m": THRESHOLD_M,
             "rectified_yaml": rectify,
             "rectified_uncal": (not rectify) and UNCAL_RECTIFY,
             "baseline_m": BASELINE_M,
-            "focal_px": FOCAL_PX
+            "focal_px": FOCAL_PX,
         },
-        "latency_s": round(dt, 3)
+        "latency_s": round(dt, 3),
     }
 
 @app.get("/frame_info")
@@ -508,11 +559,11 @@ def frame_info():
     wL = int(capL.get(cv2.CAP_PROP_FRAME_WIDTH))
     hL = int(capL.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fpsL = capL.get(cv2.CAP_PROP_FPS)
-    info = {"capL":{"W":wL,"H":hL,"FPS":fpsL,"use_sbs":use_sbs}}
+    info = {"capL": {"W": wL, "H": hL, "FPS": fpsL, "use_sbs": use_sbs}}
     if not use_sbs and capR.isOpened():
         info["capR"] = {
             "W": int(capR.get(cv2.CAP_PROP_FRAME_WIDTH)),
             "H": int(capR.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-            "FPS": capR.get(cv2.CAP_PROP_FPS)
+            "FPS": capR.get(cv2.CAP_PROP_FPS),
         }
     return JSONResponse(info)
